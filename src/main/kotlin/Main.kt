@@ -15,69 +15,85 @@ fun expandKey(keyHex: Int): ByteArray {
     return ByteArray(16) { keyBytes[it % keyBytes.size] }
 }
 
-suspend fun decryptImage(image: File, key: Int, directory: String): Boolean {
-    val encryptedData = image.readBytes()
-    val iv = encryptedData.take(16).toByteArray() // Los primeros 16 bytes como IV
-    val key128 = expandKey(key) // Expande la clave a 16 bytes
-
+suspend fun decryptImage(imageBytes: ByteArray, iv: ByteArray, key: Int): ByteArray? {
+    val key128 = expandKey(key)
     val cipher = Cipher.getInstance("AES/CBC/NoPadding")
     cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key128, "AES"), IvParameterSpec(iv))
 
     return try {
-        val decrypted = cipher.doFinal(encryptedData).drop(16).toByteArray() // Descifra y elimina el IV
+        val decrypted = cipher.doFinal(iv + imageBytes).drop(16).toByteArray()
 
-        // Verificar si los primeros 3 bytes corresponden a la cabecera JPEG
+
         if (decrypted.size > 3 && decrypted[0] == 0xFF.toByte() && decrypted[1] == 0xD8.toByte() && decrypted[2] == 0xFF.toByte()) {
-            val outputFile = File(directory, "${image.nameWithoutExtension}_decrypted.jpg")
-            outputFile.writeBytes(decrypted) // Guarda la imagen descifrada
-            println("Imagen descifrada con clave 0x${key.toString(16).toUpperCase()}: ${outputFile.name}")
-            true
+            decrypted
         } else {
-            false
+            null
         }
     } catch (e: Exception) {
-        false
+        null
     }
 }
 
 suspend fun processImage(image: File, directory: String): Long {
     println("Procesando imagen: ${image.name}")
 
+    val encryptedData = image.readBytes()
+    val iv = encryptedData.take(16).toByteArray()
+    val imageBytes = encryptedData.drop(16).toByteArray()
+
+    val stopSignal = CompletableDeferred<Boolean>()
     return measureTimeMillis {
-        coroutineScope {
-            val jobs = (0x0000..0xFFFF).chunked(1000).map { keysChunk ->
-                async {
+        val found = coroutineScope {
+            (0x0000..0xFFFF).chunked(2000).map { keysChunk ->
+                async(Dispatchers.Default) {
                     for (key in keysChunk) {
-                        println("Probando clave: 0x${key.toString(16).toUpperCase()}")
-                        val success = decryptImage(image, key, directory)
-                        if (success) return@async true
+                        if (stopSignal.isCompleted) return@async false
+
+                        if (key % 100 == 0) {
+                            println("Probando clave: 0x${key.toString(16).toUpperCase()}")
+                        }
+
+                        val decrypted = decryptImage(imageBytes, iv, key)
+                        if (decrypted != null) {
+                            val outputFile = File(directory, "${image.nameWithoutExtension}_decrypted.jpg")
+                            outputFile.writeBytes(decrypted)
+                            println("Imagen descifrada con clave 0x${key.toString(16).toUpperCase()}: ${outputFile.name}")
+                            stopSignal.complete(true)
+                            return@async true
+                        }
                     }
                     false
                 }
-            }
-
-            val success = jobs.awaitAll().any { it }
-            if (!success) println("No se encontró ninguna clave válida para la imagen ${image.name}")
+            }.awaitAll().any { it }
         }
+
+        if (!found && !stopSignal.isCompleted) println("No se encontró ninguna clave válida para la imagen ${image.name}")
     }
 }
 
 fun main() = runBlocking {
-    println("hola")
-    val directory = "./cifradas" // Ruta del directorio de las imágenes cifradas
+    val directory = "./cifradas"
     val images = File(directory).listFiles()?.filter { it.extension == "bin" } ?: return@runBlocking
 
     println("Archivos a procesar: ${images.size}")
 
     val totalDuration = measureTimeMillis {
+        val parallelism = Runtime.getRuntime().availableProcessors()
+        println("Usando paralelismo con $parallelism hilos")
+
         val results = images.map { image ->
-            async {
-                val duration = processImage(image, directory)
-                println("Tiempo de procesamiento para ${image.name}: ${duration} ms")
+            async(Dispatchers.Default.limitedParallelism(parallelism)) {
+
+                val imageDuration = measureTimeMillis {
+                    val duration = processImage(image, directory)
+                }
+
             }
         }
         results.awaitAll()
     }
-
     println("Procesamiento total completado en ${totalDuration} ms")
 }
+
+
+
